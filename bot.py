@@ -1,5 +1,8 @@
 import os
 import logging
+import threading
+
+from flask import Flask
 from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ChatType
@@ -9,6 +12,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# =========================
+# KONFIGURASI
+# =========================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,79 +27,113 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """
-Kamu adalah admin customer service toko Gudang Borongan Surabaya.
 
-ATURAN:
-- Jawab menggunakan Bahasa Indonesia.
-- Jawaban harus singkat, jelas, ramah, dan natural seperti admin manusia.
-- Maksimal 1-2 kalimat.
-- Jangan menjawab panjang lebar.
-- Toko berlokasi di Surabaya.
-- Fokus menjawab pertanyaan calon pembeli mengenai toko, produk, pemesanan, dan pengiriman.
-- Jangan mengarang harga, stok, alamat lengkap, nomor rekening, atau informasi yang belum diketahui.
-- Jika informasi tidak diketahui, arahkan secara singkat untuk menunggu admin.
-- Jika ditanya apakah toko amanah/terpercaya, jawab secara positif dan singkat tanpa mengarang bukti, testimoni, atau jaminan.
-- Jangan menawarkan mengirim bukti apa pun.
+# =========================
+# SERVER UNTUK RENDER
+# =========================
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "Gudang Surabaya AI Bot aktif", 200
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+
+# =========================
+# AI BOT TELEGRAM
+# =========================
+
+SYSTEM_PROMPT = """
+Kamu adalah admin customer service Gudang Borongan Surabaya.
+
+Tugas kamu membantu menjawab pertanyaan calon pembeli dengan bahasa Indonesia
+yang singkat, sopan, natural, dan tidak terlihat seperti robot.
+
+Toko menjual barang perabot, barang cuci gudang, barang retur,
+dan barang borongan.
+
+Jangan mengarang harga, stok, alamat, nomor rekening, ongkir,
+atau informasi produk yang belum diberikan.
+
+Jika informasi tidak diketahui, arahkan pelanggan untuk menunggu admin.
 """
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == ChatType.PRIVATE:
-        return False
 
-    member = await context.bot.get_chat_member(
-        update.effective_chat.id,
-        update.effective_user.id
-    )
+async def jawab_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
 
-    return member.status in ("administrator", "creator")
-
-
-async def reply_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not message or not message.text:
         return
 
-    if update.effective_user.is_bot:
+    # Hanya merespons grup/supergroup
+    if update.effective_chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
         return
 
-    # Di grup: jangan balas admin/owner
-    if update.effective_chat.type != ChatType.PRIVATE:
-        try:
-            if await is_admin(update, context):
-                return
-        except Exception as e:
-            logging.error("Gagal cek admin: %s", e)
-            return
+    # Jangan membalas pesan dari bot
+    if update.effective_user and update.effective_user.is_bot:
+        return
 
     try:
-        response = await client.responses.create(
-            model="gpt-5-mini",
-            instructions=SYSTEM_PROMPT,
-            input=update.message.text,
-            max_output_tokens=100,
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": message.text,
+                },
+            ],
+            max_tokens=250,
+            temperature=0.7,
         )
 
-        answer = response.output_text.strip()
+        jawaban = response.choices[0].message.content
 
-        if answer:
-            await update.message.reply_text(answer)
+        if jawaban:
+            await message.reply_text(jawaban)
 
-    except Exception as e:
-        logging.error("AI error: %s", e)
-        await update.message.reply_text(
-            "Mohon tunggu sebentar kak, admin akan membantu."
-        )
+    except Exception as error:
+        logging.exception("Terjadi error: %s", error)
 
+
+# =========================
+# JALANKAN BOT
+# =========================
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Jalankan server Render
+    threading.Thread(
+        target=run_web_server,
+        daemon=True,
+    ).start()
 
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, reply_ai)
+    # Jalankan Telegram bot
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            jawab_ai,
+        )
     )
 
-    print("Bot aktif...")
-    app.run_polling(drop_pending_updates=True)
+    print("Gudang Surabaya AI Bot aktif...")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
